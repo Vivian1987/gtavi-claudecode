@@ -14,7 +14,7 @@ import argparse, asyncio, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import ffprobe, load_json, run, tool
-from cut import CAP_Y, build_ass, video_filter
+from cut import CAP_Y, build_ass, ensure_clip_source, video_encoder_args, video_filter
 
 VOICES = {"es": "es-ES-AlvaroNeural", "pt": "pt-BR-AntonioNeural", "de": "de-DE-ConradNeural",
           "ru": "ru-RU-DmitryNeural", "fr": "fr-FR-HenriNeural", "it": "it-IT-DiegoNeural",
@@ -84,8 +84,15 @@ def make_voice(lang, text, dest):
 
 
 def render(src, s0, e0, layout, cam, ass, mp4, voice_mp3=None):
-    v = video_filter(layout, cam, ass)
-    cmd = [tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{s0:.2f}", "-to", f"{e0:.2f}", "-i", src]
+    src_dims = None
+    cam_side = "right"
+    if layout == "react":
+        vs = next(x for x in ffprobe(src)["streams"] if x.get("codec_type") == "video")
+        src_dims = (int(vs["width"]), int(vs["height"]))
+        cx, _, cw, _ = map(float, cam.split(":"))
+        cam_side = "left" if (cx + cw / 2) < 0.5 else "right"
+    v = video_filter(layout, cam, ass, cam_side=cam_side, src=src_dims)
+    cmd = [tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{s0:.2f}", "-to", f"{e0:.2f}", "-i", str(src)]
     if voice_mp3:
         dur = float(ffprobe(voice_mp3)["format"]["duration"])
         tempo = f"atempo={min(2.0, dur / HOOK_SECONDS):.3f}," if dur > HOOK_SECONDS else ""
@@ -96,7 +103,7 @@ def render(src, s0, e0, layout, cam, ass, mp4, voice_mp3=None):
         cmd += ["-filter_complex", v + ";" + a, "-map", "[vo]", "-map", "[ao]"]
     else:
         cmd += ["-filter_complex", v, "-map", "[vo]", "-map", "0:a?", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
-    cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+    cmd += [*video_encoder_args(), "-c:a", "aac", "-b:a", "160k",
             "-ar", "48000", "-movflags", "+faststart", str(mp4)]
     run(cmd)
 
@@ -117,7 +124,7 @@ def main():
     ap.add_argument("job"); ap.add_argument("--pick", type=int, default=1)
     ap.add_argument("--langs", default="es,pt,de,ru")
     ap.add_argument("--voice", action="store_true")
-    ap.add_argument("--layout", choices=["fill", "blur", "facecam"])
+    ap.add_argument("--layout", choices=["fill", "blur", "facecam", "react"])
     ap.add_argument("--cam"); ap.add_argument("--hook")
     a = ap.parse_args()
     d = Path(a.job); out = d / "edits"
@@ -128,11 +135,26 @@ def main():
     cands = load_json(d / "candidates.json")
     s0, e0 = meta["start"], meta["end"]
     layout = a.layout or meta.get("layout", "blur")
-    cam = a.cam or "0.70:0.68:0.30:0.32"
+    raw_cam = meta.get("cam")
+    cam = a.cam or (raw_cam if raw_cam and raw_cam != "auto" else "0.70:0.68:0.30:0.32")
     hook = a.hook if a.hook is not None else meta.get("hook", "")
     credit = ""
     words = [w for w in load_json(d / "transcript.json") if s0 <= w["s"] < e0 and w["w"]]
     langs = [x.strip() for x in a.langs.split(",") if x.strip()]
+    src_vid = meta.get("segment_file") or cands.get("source")
+    ls0 = meta.get("local_start", s0)
+    le0 = meta.get("local_end", e0)
+    if not src_vid or not Path(src_vid).exists():
+        src_vid, seg_off, is_seg = ensure_clip_source(d, cands, a.pick, s0, e0)
+        ls0 = max(0.0, round(s0 - seg_off, 2))
+        le0 = round(ls0 + (e0 - s0), 2)
+        if is_seg:
+            try:
+                seg_dur = float(ffprobe(src_vid)["format"]["duration"] or 0)
+                if seg_dur > 0:
+                    le0 = min(seg_dur, le0)
+            except Exception:
+                pass
     caps = ["# Captions, one clip in several languages\n",
             f"Source: {meta.get('source_title') or ''} ({meta.get('source_channel') or ''})\n",
             "Translations are machine translated. Read each one before posting.\n"]
@@ -146,7 +168,7 @@ def main():
         mp3 = None
         if a.voice and h:
             mp3 = make_voice(lang, h, Path(tempfile.gettempdir()) / f"clip_{a.pick}_{lang}_hook.mp3")
-        render(cands["source"], s0, e0, layout, cam, ass, mp4, mp3)
+        render(str(src_vid), ls0, le0, layout, cam, ass, mp4, mp3)
         caps.append(platform_block(lang, h, credit, meta.get("source_url")))
         print(mp4)
     (out / f"clip_{a.pick}_captions.md").write_text("\n".join(caps), encoding="utf-8")

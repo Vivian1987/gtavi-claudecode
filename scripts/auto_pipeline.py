@@ -23,6 +23,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from common import load_json, run, save_json, ytdlp_json
+from moments import build_hooks
 from smart_queue import add_to_queue, get_next_optimal_slot, load_queue
 from social_config import load_social_config
 from telegram_bot import TelegramDesk, load_config
@@ -84,32 +85,36 @@ def run_pipeline_step(cmd, desc):
 
 
 def extract_hook_from_candidate(candidate, info):
-    """Generates an engaging 1-second hook text based on candidate speech or title."""
-    text = candidate.get("text", "").strip()
-    title = info.get("title", "")
-    
-    # Priority: short punchy candidate sentence
-    if text:
-        first_sentence = text.split(".")[0].split("?")[0].split("!")[0]
-        words = first_sentence.split()
-        if 3 <= len(words) <= 8:
-            return " ".join(words).upper()
+    """Generates an engaging hook text based on candidate speech or title."""
+    primary, _ = build_hooks(candidate.get("text", ""), info or {}, candidate.get("why", []))
+    if primary:
+        return primary
 
-    # Fallback to punchy title segment
+    title = (info or {}).get("title", "")
     clean_title = title.split("|")[0].split("-")[0].strip()
     return clean_title[:45].upper() if clean_title else "GTA 6 INSANE MOMENT"
 
 
-def process_video(url, campaign_file=None):
-    mark_processed(url)
-    
-    # Step 1: Moments finder
-    print(f"\n[1/4] Running moments finder on {url}...")
-    run_res = subprocess.run([sys.executable, "scripts/moments.py", url, "--top", "5", "--max-minutes", "60"],
-                             check=False, stdout=subprocess.PIPE, text=True)
+def process_video(url, campaign_file=None, max_clips=5, min_score=2.0, max_minutes=0, layout="facecam", top_candidates=None):
+    if top_candidates is None:
+        top_candidates = 50 if max_clips == 0 else max(25, max_clips * 2)
+
+    # Step 1: Moments finder (audio-first for remote URLs)
+    print(f"\n[1/4] Running moments finder on {url} (max_minutes={max_minutes or 'full'}, min_score={min_score})...")
+    run_res = subprocess.run(
+        [
+            sys.executable, "scripts/moments.py", url,
+            "--top", str(top_candidates),
+            "--max-minutes", str(max_minutes),
+            "--min-score", str(min_score),
+        ],
+        check=False, stdout=subprocess.PIPE, text=True,
+    )
     if run_res.returncode != 0:
+        if run_res.stdout:
+            print(run_res.stdout.rstrip())
         print("Failed to analyze video moments.")
-        return None
+        return []
 
     # Locate job directory from output
     job_dir = None
@@ -117,81 +122,98 @@ def process_video(url, campaign_file=None):
         if line.startswith("job: "):
             job_dir = Path(line.replace("job: ", "").strip())
             break
-            
+
     if not job_dir or not (job_dir / "candidates.json").exists():
         print("No job directory or candidates.json found.")
-        return None
+        return []
 
     cand_data = load_json(job_dir / "candidates.json")
-    candidates = cand_data.get("candidates", [])
+    info = cand_data.get("info", {})
+    mark_processed(url)
+    if info.get("id"):
+        mark_processed(info["id"])
+
+    candidates = [c for c in cand_data.get("candidates", []) if c.get("score", 0) >= min_score]
     if not candidates:
         print("No high-confidence moments detected in video.")
-        return None
+        return []
 
-    info = cand_data.get("info", {})
+    # Prioritize highest-scoring moments first
+    candidates.sort(key=lambda c: (-c.get("score", 0), c.get("start", 0)))
+    if max_clips > 0:
+        candidates = candidates[:max_clips]
+
     channel = info.get("channel") or info.get("uploader") or "creator"
-    source_title = info.get("title", "GTA 6 Clip")
+    queued_items = []
+    desk = None
+    desk_init_failed = False
 
-    # Step 2: Try cutting top candidate
-    top_cand = candidates[0]
-    hook = extract_hook_from_candidate(top_cand, info)
-    print(f"\n[2/4] Cutting top moment #{top_cand['n']} with hook: '{hook}'...")
+    for idx, cand in enumerate(candidates, 1):
+        hook = cand.get("hook") or extract_hook_from_candidate(cand, info)
+        print(f"\n[2/4] Cutting clip {idx}/{len(candidates)} (moment #{cand['n']}, score={cand.get('score')}) with hook: '{hook}'...")
 
-    cut_cmd = ["scripts/cut.py", str(job_dir), "--pick", str(top_cand["n"]), "--hook", hook, "--layout", "facecam"]
-    res = subprocess.run([sys.executable] + cut_cmd, check=False)
-    if res.returncode != 0:
-        # Fallback without facecam
-        print("Facecam layout failed, falling back to blur background...")
-        cut_cmd = ["scripts/cut.py", str(job_dir), "--pick", str(top_cand["n"]), "--hook", hook, "--layout", "blur"]
+        cut_cmd = ["scripts/cut.py", str(job_dir), "--pick", str(cand["n"]), "--hook", hook, "--layout", layout]
         res = subprocess.run([sys.executable] + cut_cmd, check=False)
+        if res.returncode != 0 and layout != "blur":
+            print(f"{layout} layout failed, falling back to blur background...")
+            cut_cmd = ["scripts/cut.py", str(job_dir), "--pick", str(cand["n"]), "--hook", hook, "--layout", "blur"]
+            res = subprocess.run([sys.executable] + cut_cmd, check=False)
         if res.returncode != 0:
-            print("Failed to render clip.")
-            return None
+            print(f"Failed to render clip #{cand['n']}, skipping.")
+            continue
 
-    clip_mp4 = job_dir / "edits" / f"clip_{top_cand['n']}.mp4"
-    if not clip_mp4.exists():
-        print(f"Rendered clip not found at {clip_mp4}")
-        return None
+        clip_mp4 = job_dir / "edits" / f"clip_{cand['n']}.mp4"
+        if not clip_mp4.exists():
+            print(f"Rendered clip not found at {clip_mp4}, skipping.")
+            continue
 
-    # Step 3: Rule check
-    print(f"\n[3/4] Verifying clip rules for {clip_mp4}...")
-    check_cmd = [sys.executable, "scripts/check.py", str(clip_mp4)]
-    if campaign_file and Path(campaign_file).exists():
-        check_cmd += ["--campaign", str(campaign_file)]
-    
-    check_res = subprocess.run(check_cmd, check=False)
-    if check_res.returncode != 0:
-        print("Clip failed pre-post quality or safety checks.")
-        return None
+        caption = (
+            f"{hook}!\n\n"
+            f"What do you think of this? Drop your thoughts below 👇\n\n"
+            f"🎥 Credit: @{channel}\n"
+            f"#GTA6 #GTAVI #RockstarGames #Gaming #ViceCity"
+        )
 
-    # Step 4: Add to Smart Queue & Send to Telegram
-    print(f"\n[4/4] Scheduling & Dispatching to Telegram...")
-    caption = (
-        f"{hook}!\n\n"
-        f"What do you think of this? Drop your thoughts below 👇\n\n"
-        f"🎥 Credit: @{channel}\n"
-        f"#GTA6 #GTAVI #RockstarGames #Gaming #ViceCity"
-    )
+        # Step 3: Rule check
+        print(f"\n[3/4] Verifying clip rules for {clip_mp4}...")
+        check_cmd = [sys.executable, "scripts/check.py", str(clip_mp4), "--caption", caption]
+        if campaign_file and Path(campaign_file).exists():
+            check_cmd += ["--campaign", str(campaign_file)]
 
-    item = add_to_queue(
-        job_id=job_dir.name,
-        clip_file=clip_mp4,
-        hook=hook,
-        caption=caption,
-        credit=channel,
-        source_url=url,
-        platforms=load_social_config().get("default_platforms"),
-    )
+        check_res = subprocess.run(check_cmd, check=False)
+        if check_res.returncode != 0:
+            print(f"Clip #{cand['n']} failed pre-post quality or safety checks, skipping.")
+            continue
 
-    try:
-        desk = TelegramDesk()
-        desk.send_video_for_approval(item)
-        print(f"Successfully queued and sent to Telegram! Next optimal slot: {item['scheduled_time']}")
-        return item
-    except Exception as e:
-        print(f"Could not send to Telegram: {e}")
-        print("Check that TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in bot_config.json")
-        return item
+        # Step 4: Add to Smart Queue & Send to Telegram
+        print(f"\n[4/4] Scheduling & Dispatching to Telegram...")
+        item = add_to_queue(
+            job_id=job_dir.name,
+            clip_file=clip_mp4,
+            hook=hook,
+            caption=caption,
+            credit=channel,
+            source_url=url,
+            platforms=load_social_config().get("default_platforms"),
+        )
+        queued_items.append(item)
+
+        if not desk_init_failed and desk is None:
+            try:
+                desk = TelegramDesk()
+            except Exception as e:
+                desk_init_failed = True
+                print(f"Could not initialize Telegram: {e}")
+                print("Check that TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in bot_config.json")
+        if desk is not None:
+            try:
+                desk.send_video_for_approval(item)
+                print(f"Successfully queued and sent to Telegram! Next optimal slot: {item['scheduled_time']}")
+            except Exception as e:
+                print(f"Could not send to Telegram: {e}")
+                print("Check that TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in bot_config.json")
+
+    return queued_items
 
 
 def telegram_listener_daemon():
@@ -215,6 +237,10 @@ def main():
     ap.add_argument("--interval-hours", type=float, default=3.0, help="Hours between automated scans")
     ap.add_argument("--url", help="Process a specific video URL directly instead of scanning trends")
     ap.add_argument("--campaign", default="campaigns.md", help="Path to campaigns.md file")
+    ap.add_argument("--max-clips", type=int, default=5, help="Max high-score clips to cut per video (0 = all)")
+    ap.add_argument("--min-score", type=float, default=2.0, help="Minimum candidate score threshold")
+    ap.add_argument("--max-minutes", type=int, default=0, help="Max minutes to analyze (0 = full video)")
+    ap.add_argument("--layout", choices=["fill", "blur", "facecam", "react"], default="facecam")
     a = ap.parse_args()
 
     # Start Telegram callback listener in background thread
@@ -222,11 +248,17 @@ def main():
     t.start()
 
     if a.url:
-        process_video(a.url, a.campaign)
-        if a.loop or a.once:
+        process_video(a.url, a.campaign, max_clips=a.max_clips, min_score=a.min_score, max_minutes=a.max_minutes, layout=a.layout)
+        if a.loop:
             print("Finished processing provided URL. Listener is active. Press Ctrl+C to exit.")
             while True:
                 time.sleep(1)
+        elif a.once:
+            print("\nRun completed (--once). Keeping Telegram listener alive for 2 minutes or until Ctrl+C...")
+            try:
+                time.sleep(120)
+            except KeyboardInterrupt:
+                pass
         return
 
     while True:
@@ -237,7 +269,7 @@ def main():
         target_url = find_next_trending_video()
         if target_url:
             print(f"Found target trending video: {target_url}")
-            process_video(target_url, a.campaign)
+            process_video(target_url, a.campaign, max_clips=a.max_clips, min_score=a.min_score, max_minutes=a.max_minutes, layout=a.layout)
         else:
             print("No new trending videos found at this moment.")
 

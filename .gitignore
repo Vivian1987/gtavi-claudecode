@@ -9,4 +9,5 @@ test/
 bot_config.json
 vice-city-daily
 social_config.json
-social_config.json
+.*.lock
+
