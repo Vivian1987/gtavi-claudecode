@@ -24,6 +24,7 @@ except Exception:
 sys.path.insert(0, str(Path(__file__).parent))
 from common import load_json, run, save_json, ytdlp_json
 from smart_queue import add_to_queue, get_next_optimal_slot, load_queue
+from social_config import load_social_config
 from telegram_bot import TelegramDesk, load_config
 
 PROCESSED_FILE = Path("jobs/processed.json")
@@ -178,7 +179,8 @@ def process_video(url, campaign_file=None):
         hook=hook,
         caption=caption,
         credit=channel,
-        source_url=url
+        source_url=url,
+        platforms=load_social_config().get("default_platforms"),
     )
 
     try:
