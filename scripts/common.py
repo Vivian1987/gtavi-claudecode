@@ -60,3 +60,27 @@ def save_json(path, obj):
 
 def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def slugify(text: str, max_len: int = 36) -> str:
+    """Convert text to a clean lowercase underscore slug trimmed on word boundaries."""
+    s = re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
+    if len(s) <= max_len:
+        return s
+    cut = s[:max_len].rsplit("_", 1)[0]
+    return cut or s[:max_len].strip("_")
+
+
+def clip_stem(channel: str, num: int, title: str = "") -> str:
+    """Build a consistent `<channel>_clip_<n>_<title_slug>` stem across all scripts."""
+    ch = slugify(channel, max_len=24)
+    base = f"{ch}_clip_{num}" if ch else f"clip_{num}"
+    t_slug = slugify(title, max_len=36)
+    if ch and t_slug.startswith(f"{ch}_"):
+        t_slug = t_slug[len(ch) + 1:].lstrip("_")
+    return f"{base}_{t_slug}" if t_slug else base
+
+
+def clip_filename(channel: str, num: int, title: str = "", ext: str = "mp4") -> str:
+    """Build a consistent `<channel>_clip_<n>_<title_slug>.<ext>` filename."""
+    return f"{clip_stem(channel, num, title)}.{ext.lstrip('.')}"

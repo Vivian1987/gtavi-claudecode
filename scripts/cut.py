@@ -1,15 +1,18 @@
 """Cut one candidate into a finished vertical clip.
 
 1080x1920, 30 fps, word-by-word burned captions (slurs and swears masked), hook box in the first seconds,
-loudness normalised to -14 LUFS. Writes jobs/<id>/edits/clip_<n>.mp4 + .json (metadata for check.py).
+loudness normalised to -14 LUFS. Supports on-demand 1080p segment downloads for audio-first jobs
+and RTX NVENC hardware acceleration with automatic CPU fallback.
+Writes jobs/<id>/edits/clip_<n>.mp4 + .json (metadata for check.py).
 
 usage: python cut.py jobs/<id> --pick 1 [--layout fill|blur|facecam|react] [--hook "TEXT"]
-                     [--cam auto|x:y:w:h] [--title "TEXT" --title-style box|outline --title-secs 0] [--captions word|bubble|none]
+                     [--cam auto|x:y:w:h] [--title "TEXT" --title-style box|outline --title-secs 0]
+                     [--captions word|bubble|none] [--encoder auto|nvenc|cpu]
 """
-import argparse, sys
+import argparse, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
-from common import load_json, run, save_json, tool
+from common import clip_stem, ffprobe, load_json, run, save_json, tool, ytdlp_base
 
 W, H = 1080, 1920
 
@@ -101,6 +104,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             ev.append(f"Dialogue: 0,{ts(a)},{ts(b)},Cap,,0,0,0,,{{\\pos({W // 2},{cap_y})}}{pop}{' '.join(parts)}")
     if title:  # reaction title: (style, text, y, seconds)
         st, text, ty, secs = title
+        text = clean(text, profanity)
         end = (e0 - s0) if secs <= 0 else secs
         lines = wrap(esc(text), 26 if st == 'box' else 24)
         body = '\\N'.join(lines)
@@ -110,6 +114,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             ev.append(f"Dialogue: 2,{ts(0)},{ts(end)},TitleOut,,0,0,0,,{{\\pos({W // 2},{ty})\\an8}}{body}")
         hook = ''
     if hook:
+        hook = clean(hook, profanity)
         ev.append(f"Dialogue: 1,{ts(0)},{ts(hook_end)},Hook,,0,0,0,,{{\\fad(0,180)\\fscx92\\fscy92\\t(0,120,\\fscx100\\fscy100)}}{esc(hook)}")
     return hdr + "\n".join(ev) + "\n"
 
@@ -149,8 +154,9 @@ def video_filter(layout, cam, ass, band=None, cam_side='right', src=None, game_x
             v = v[:-3] + f"[v0];[v0]drawbox=x=0:y={y0}:w=iw:h={bh}:color=white@1:t=fill{en}[v]"
     else:
         x, y, w, h = map(float, cam.split(":"))
-        v = (f"[0:v]split[a][b];[a]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},scale={W}:{int(H * 0.38)}:force_original_aspect_ratio=increase,"
-             f"crop={W}:{int(H * 0.38)}[cam];[b]scale=-2:{H - int(H * 0.38)},crop={W}:{H - int(H * 0.38)}[game];[cam][game]vstack[v]")
+        cam_h = even(H * 0.38)
+        v = (f"[0:v]split[a][b];[a]crop=iw*{w}:ih*{h}:iw*{x}:ih*{y},scale={W}:{cam_h}:force_original_aspect_ratio=increase,"
+             f"crop={W}:{cam_h}[cam];[b]scale=-2:{H - cam_h},crop={W}:{H - cam_h}[game];[cam][game]vstack[v]")
     sub = str(ass).replace("\\", "/").replace(":", "\\:")
     return v + f";[v]fps=30,subtitles='{sub}'[vo]"
 
@@ -196,6 +202,75 @@ def game_offset(video, s0, e0, src, cam_box):
     return bx
 
 
+_NVENC_AVAILABLE = None
+
+
+def has_nvenc() -> bool:
+    """Probe whether ffmpeg supports h264_nvenc on the local GPU."""
+    global _NVENC_AVAILABLE
+    if _NVENC_AVAILABLE is not None:
+        return _NVENC_AVAILABLE
+    try:
+        r = subprocess.run(
+            [
+                tool("ffmpeg"), "-hide_banner", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc=duration=0.2:size=320x240:rate=30",
+                "-c:v", "h264_nvenc", "-preset", "p6", "-cq", "20", "-pix_fmt", "yuv420p",
+                "-f", "null", "-",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        _NVENC_AVAILABLE = (r.returncode == 0)
+    except Exception:
+        _NVENC_AVAILABLE = False
+    return _NVENC_AVAILABLE
+
+
+def video_encoder_args(encoder: str = "auto") -> list[str]:
+    """Return ffmpeg video encoder flags for RTX NVENC or CPU libx264."""
+    use_nvenc = (encoder == "nvenc") or (encoder == "auto" and has_nvenc())
+    if use_nvenc:
+        return ["-c:v", "h264_nvenc", "-preset", "p6", "-cq", "20", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p"]
+
+
+def ensure_clip_source(job_path: Path, cand_data: dict, pick_num: int, s0: float, e0: float, padding: float = 5.0) -> tuple[Path, float, bool]:
+    """Return (video_path, segment_start_offset, is_segment) downloading a padded 1080p segment if needed."""
+    src_str = cand_data.get("source")
+    if src_str and Path(src_str).exists():
+        return Path(src_str), 0.0, False
+
+    webpage_url = cand_data.get("info", {}).get("webpage_url")
+    if not webpage_url:
+        sys.exit("No local source video and no webpage_url in candidates.json")
+
+    dur = float(cand_data.get("duration") or 0)
+    seg_start = max(0.0, round(s0 - padding, 2))
+    seg_end = round(e0 + padding, 2)
+    if dur > 0:
+        seg_end = min(dur, seg_end)
+
+    seg_dir = job_path / "segments"
+    seg_dir.mkdir(exist_ok=True)
+    seg_mp4 = seg_dir / f"seg_{pick_num}_{int(round(seg_start * 100))}_{int(round(seg_end * 100))}.mp4"
+    if not seg_mp4.exists():
+        print(f"Fetching 1080p segment [{seg_start:.1f}s - {seg_end:.1f}s] -> {seg_mp4.name}")
+        run(
+            ytdlp_base()
+            + [
+                "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b",
+                "--merge-output-format", "mp4",
+                "--download-sections", f"*{seg_start}-{seg_end}",
+                "--force-keyframes-at-cuts",
+                "-o", str(seg_mp4),
+                webpage_url,
+            ]
+        )
+    return seg_mp4, seg_start, True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("job"); ap.add_argument("--pick", type=int, default=1)
@@ -204,35 +279,53 @@ def main():
     ap.add_argument("--title-style", choices=["box", "outline"], default="box")
     ap.add_argument("--title-secs", type=float, default=0, help="0 = whole clip")
     ap.add_argument("--captions", choices=["word", "bubble", "none"], default="word")
-    ap.add_argument("--hook", default="")
+    ap.add_argument("--hook", default=None)
     ap.add_argument("--allow-profanity", action="store_true", help="keep swear words in captions (slurs are always masked)")
     ap.add_argument("--cam", default="auto", help="auto (find the webcam) or x:y:w:h fractions")
+    ap.add_argument("--encoder", choices=["auto", "nvenc", "cpu"], default="auto")
     ap.add_argument("--start", type=float); ap.add_argument("--end", type=float)
     a = ap.parse_args()
     d = Path(a.job); c = load_json(d / "candidates.json")
-    pick = next(x for x in c["candidates"] if x["n"] == a.pick)
+    pick = next((x for x in c.get("candidates", []) if x["n"] == a.pick), None)
+    if pick is None:
+        sys.exit(f"Candidate #{a.pick} not found in {d / 'candidates.json'}")
     s0 = a.start if a.start is not None else pick["start"]; e0 = a.end if a.end is not None else pick["end"]
+    if e0 <= s0:
+        sys.exit(f"Invalid clip timestamps: start={s0}, end={e0}")
+    hook_text = a.hook if a.hook is not None else (pick.get("hook", "") if not a.title else "")
     words = load_json(d / "transcript.json")
     out = d / "edits"; out.mkdir(exist_ok=True)
+    src_vid, seg_offset, is_segment = ensure_clip_source(d, c, a.pick, s0, e0)
+    local_s0 = max(0.0, round(s0 - seg_offset, 2))
+    local_e0 = round(local_s0 + (e0 - s0), 2)
+    if is_segment:
+        try:
+            seg_dur = float(ffprobe(src_vid)["format"]["duration"] or 0)
+            if seg_dur > 0:
+                local_e0 = min(seg_dur, local_e0)
+        except Exception:
+            pass
+    if local_e0 <= local_s0:
+        sys.exit(f"Invalid local clip timestamps: start={local_s0}, end={local_e0}")
+
     layout, cam, side = a.layout, a.cam, 'right'
     face_expr = None
     if layout in ('react', 'facecam') and cam == 'auto':
         from facecam import find_cam
-        r = find_cam(c['source'], s0, e0)
+        r = find_cam(str(src_vid), local_s0, local_e0)
         if layout == 'react' and r.get('mode') not in ('cam', 'face'):
             sys.exit(f"skipped: no streamer face over gameplay in this moment ({r.get('mode')}: {r.get('reason', '')}). "
                      "React clips need the game on screen with the cam as a separate box. Pick another moment or stream.")
         if layout == 'react':
             from facecam import has_gameplay, face_crop_expr
-            if not has_gameplay(c['source'], s0, e0, r['box']):
+            if not has_gameplay(str(src_vid), local_s0, local_e0, r['box']):
                 sys.exit("skipped: the area outside the webcam is not gameplay (same scene or no game on screen). "
                          "Pick a moment where GTA 6 is on screen.")
             if r.get('mode') == 'face' and r.get('face_track'):
-                from common import ffprobe as _fp
-                _vs = [x for x in _fp(c['source'])['streams'] if x.get('codec_type') == 'video'][0]
+                _vs = [x for x in ffprobe(src_vid)['streams'] if x.get('codec_type') == 'video'][0]
                 from facecam import inner_edges
                 sw_, sh_ = int(_vs['width']), int(_vs['height'])
-                bnd = inner_edges(c['source'], s0, e0, r['face'], sw_, sh_)
+                bnd = inner_edges(str(src_vid), local_s0, local_e0, r['face'], sw_, sh_)
                 print(f'facecam: cam borders L{bnd[0]} T{bnd[1]} R{bnd[2]} B{bnd[3]} px')
                 fe = face_crop_expr(r['face_track'], sw_, sh_, W, TOP, bounds=bnd)
                 face_expr = (fe['w'], fe['h'], fe['x'], fe['y'])
@@ -254,33 +347,42 @@ def main():
     cap_y = CAP_Y[layout]
     title, band = None, None
     if a.title and layout == 'react':
-        n = len(wrap(a.title, 26 if a.title_style == 'box' else 24))
+        n = len(wrap(esc(clean(a.title, a.allow_profanity)), 26 if a.title_style == 'box' else 24))
         if a.title_style == 'box':
             bh = n * 78 + 44
             band = (TOP - bh // 2, bh, a.title_secs)
             title = ('box', a.title, TOP, a.title_secs)
         else:
             title = ('outline', a.title, TOP + 40, a.title_secs)
-    ass = out / f"clip_{a.pick}.ass"
+    info = c.get("info", {})
+    channel = info.get("channel") or info.get("uploader") or ""
+    stem = clip_stem(channel, a.pick, a.title or hook_text)
+    ass = out / f"{stem}.ass"
     caps = a.captions
     cap_words = words if caps != 'none' else []
-    ass.write_text(build_ass(cap_words, s0, e0, a.hook, cap_y, title=title, caps=caps, profanity=a.allow_profanity), encoding="utf-8")
+    ass.write_text(build_ass(cap_words, s0, e0, hook_text, cap_y, title=title, caps=caps, profanity=a.allow_profanity), encoding="utf-8")
     src = None; gx = None
     if layout == 'react':
-        from common import ffprobe
-        vs = [x for x in ffprobe(c['source'])['streams'] if x.get('codec_type') == 'video'][0]
+        vs = [x for x in ffprobe(src_vid)['streams'] if x.get('codec_type') == 'video'][0]
         src = (int(vs['width']), int(vs['height']))
-        gx = game_offset(c['source'], s0, e0, src, [float(t) for t in cam.split(':')])
+        gx = game_offset(str(src_vid), local_s0, local_e0, src, [float(t) for t in cam.split(':')])
     v = video_filter(layout, cam, ass, band=band, cam_side=side, src=src, game_x=gx, face_expr=face_expr)
-    mp4 = out / f"clip_{a.pick}.mp4"
-    run([tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{s0:.2f}", "-to", f"{e0:.2f}", "-i", c["source"],
-         "-filter_complex", v, "-map", "[vo]", "-map", "0:a?", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-         "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
-         "-ar", "48000", "-movflags", "+faststart", str(mp4)])
-    info = c.get("info", {})
-    save_json(out / f"clip_{a.pick}.json", {"file": str(mp4), "start": s0, "end": e0, "layout": layout, "hook": a.hook or a.title, "title": a.title, "cam": cam,
+    mp4 = out / f"{stem}.mp4"
+    enc_args = video_encoder_args(a.encoder)
+    base_cmd = [tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{local_s0:.2f}", "-to", f"{local_e0:.2f}", "-i", str(src_vid),
+                "-filter_complex", v, "-map", "[vo]", "-map", "0:a?", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
+    tail_args = ["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", str(mp4)]
+    if a.encoder == "auto" and enc_args[1] == "h264_nvenc":
+        r = subprocess.run([*base_cmd, *enc_args, *tail_args], check=False)
+        if r.returncode != 0:
+            print("NVENC encoding failed, falling back to CPU libx264...", file=sys.stderr)
+            run([*base_cmd, *video_encoder_args("cpu"), *tail_args])
+    else:
+        run([*base_cmd, *enc_args, *tail_args])
+    save_json(out / f"{stem}.json", {"file": str(mp4), "start": s0, "end": e0, "layout": layout, "hook": hook_text or a.title, "title": a.title, "cam": cam,
+                                            "segment_file": str(src_vid) if is_segment else None, "local_start": local_s0, "local_end": local_e0,
                                             "source_url": info.get("webpage_url"), "source_title": info.get("title"),
-                                            "source_channel": info.get("channel") or info.get("uploader")})
+                                            "source_channel": channel})
     print(mp4)
 
 

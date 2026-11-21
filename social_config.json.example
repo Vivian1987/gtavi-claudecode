@@ -1,0 +1,44 @@
+{
+  "default_platforms": ["instagram", "youtube", "tiktok"],
+  "max_retries": 3,
+  "retry_backoff_minutes": [5, 15, 45],
+  "instagram": {
+    "enabled": false,
+    "api_version": "v25.0",
+    "app_id": "",
+    "app_secret": "",
+    "ig_user_id": "",
+    "access_token": "",
+    "token_obtained_at": "",
+    "token_expires_in": 5184000,
+    "share_to_feed": true
+  },
+  "youtube": {
+    "enabled": false,
+    "client_id": "",
+    "client_secret": "",
+    "access_token": "",
+    "refresh_token": "",
+    "token_expires_at": "",
+    "channel_id": "",
+    "category_id": "20",
+    "privacy_status": "private",
+    "use_native_publish_at": false,
+    "made_for_kids": false
+  },
+  "tiktok": {
+    "enabled": false,
+    "client_key": "",
+    "client_secret": "",
+    "access_token": "",
+    "refresh_token": "",
+    "token_expires_at": "",
+    "open_id": "",
+    "mode": "inbox",
+    "privacy_level": "SELF_ONLY",
+    "disable_duet": false,
+    "disable_comment": false,
+    "disable_stitch": false,
+    "redirect_uri": "http://127.0.0.1:8765/callback/"
+  }
+}
