@@ -10,7 +10,7 @@ usage: python translate.py jobs/<id> --pick <n> --langs es,pt,de,ru [--voice] [-
 translated hook only, over the first 2.5 s, with the original audio ducked under it. It never clones
 or imitates a real person's or streamer's voice.
 """
-import argparse, asyncio, sys, tempfile
+import argparse, asyncio, re, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import ffprobe, load_json, run, tool
@@ -130,7 +130,10 @@ def main():
     d = Path(a.job); out = d / "edits"
     side = out / f"clip_{a.pick}.json"
     if not side.exists():
+        side = next((p for p in sorted(out.glob(f"*_clip_{a.pick}*.json")) if not re.search(r"_[a-z]{2}\.json$", p.name)), side)
+    if not side.exists():
         sys.exit(f"{side} not found. Cut the clip first with cut.py --pick {a.pick}.")
+    stem = side.stem
     meta = load_json(side)
     cands = load_json(d / "candidates.json")
     s0, e0 = meta["start"], meta["end"]
@@ -162,17 +165,17 @@ def main():
         t = translator(lang)
         h = tr(t, hook) if hook else ""
         tw = translate_words(t, words)
-        ass = out / f"clip_{a.pick}_{lang}.ass"
+        ass = out / f"{stem}_{lang}.ass"
         ass.write_text(build_ass(tw, s0, e0, h, CAP_Y[layout]), encoding="utf-8")
-        mp4 = out / f"clip_{a.pick}_{lang}.mp4"
+        mp4 = out / f"{stem}_{lang}.mp4"
         mp3 = None
         if a.voice and h:
-            mp3 = make_voice(lang, h, Path(tempfile.gettempdir()) / f"clip_{a.pick}_{lang}_hook.mp3")
+            mp3 = make_voice(lang, h, Path(tempfile.gettempdir()) / f"{stem}_{lang}_hook.mp3")
         render(str(src_vid), ls0, le0, layout, cam, ass, mp4, mp3)
         caps.append(platform_block(lang, h, credit, meta.get("source_url")))
         print(mp4)
-    (out / f"clip_{a.pick}_captions.md").write_text("\n".join(caps), encoding="utf-8")
-    print(out / f"clip_{a.pick}_captions.md")
+    (out / f"{stem}_captions.md").write_text("\n".join(caps), encoding="utf-8")
+    print(out / f"{stem}_captions.md")
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ except Exception:
     pass
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import load_json, run, save_json, ytdlp_json
+from common import clip_filename, load_json, run, save_json, ytdlp_json
 from moments import build_hooks
 from smart_queue import add_to_queue, get_next_optimal_slot, load_queue
 from social_config import load_social_config
@@ -162,7 +162,9 @@ def process_video(url, campaign_file=None, max_clips=5, min_score=2.0, max_minut
             print(f"Failed to render clip #{cand['n']}, skipping.")
             continue
 
-        clip_mp4 = job_dir / "edits" / f"clip_{cand['n']}.mp4"
+        clip_mp4 = job_dir / "edits" / clip_filename(channel, cand["n"], hook)
+        if not clip_mp4.exists():
+            clip_mp4 = next((job_dir / "edits").glob(f"*clip_{cand['n']}*.mp4"), clip_mp4)
         if not clip_mp4.exists():
             print(f"Rendered clip not found at {clip_mp4}, skipping.")
             continue

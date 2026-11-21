@@ -12,7 +12,7 @@ usage: python cut.py jobs/<id> --pick 1 [--layout fill|blur|facecam|react] [--ho
 import argparse, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
-from common import ffprobe, load_json, run, save_json, tool, ytdlp_base
+from common import clip_stem, ffprobe, load_json, run, save_json, tool, ytdlp_base
 
 W, H = 1080, 1920
 
@@ -354,7 +354,10 @@ def main():
             title = ('box', a.title, TOP, a.title_secs)
         else:
             title = ('outline', a.title, TOP + 40, a.title_secs)
-    ass = out / f"clip_{a.pick}.ass"
+    info = c.get("info", {})
+    channel = info.get("channel") or info.get("uploader") or ""
+    stem = clip_stem(channel, a.pick, a.title or hook_text)
+    ass = out / f"{stem}.ass"
     caps = a.captions
     cap_words = words if caps != 'none' else []
     ass.write_text(build_ass(cap_words, s0, e0, hook_text, cap_y, title=title, caps=caps, profanity=a.allow_profanity), encoding="utf-8")
@@ -364,7 +367,7 @@ def main():
         src = (int(vs['width']), int(vs['height']))
         gx = game_offset(str(src_vid), local_s0, local_e0, src, [float(t) for t in cam.split(':')])
     v = video_filter(layout, cam, ass, band=band, cam_side=side, src=src, game_x=gx, face_expr=face_expr)
-    mp4 = out / f"clip_{a.pick}.mp4"
+    mp4 = out / f"{stem}.mp4"
     enc_args = video_encoder_args(a.encoder)
     base_cmd = [tool("ffmpeg"), "-y", "-v", "error", "-ss", f"{local_s0:.2f}", "-to", f"{local_e0:.2f}", "-i", str(src_vid),
                 "-filter_complex", v, "-map", "[vo]", "-map", "0:a?", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
@@ -376,11 +379,10 @@ def main():
             run([*base_cmd, *video_encoder_args("cpu"), *tail_args])
     else:
         run([*base_cmd, *enc_args, *tail_args])
-    info = c.get("info", {})
-    save_json(out / f"clip_{a.pick}.json", {"file": str(mp4), "start": s0, "end": e0, "layout": layout, "hook": hook_text or a.title, "title": a.title, "cam": cam,
+    save_json(out / f"{stem}.json", {"file": str(mp4), "start": s0, "end": e0, "layout": layout, "hook": hook_text or a.title, "title": a.title, "cam": cam,
                                             "segment_file": str(src_vid) if is_segment else None, "local_start": local_s0, "local_end": local_e0,
                                             "source_url": info.get("webpage_url"), "source_title": info.get("title"),
-                                            "source_channel": info.get("channel") or info.get("uploader")})
+                                            "source_channel": channel})
     print(mp4)
 
 
