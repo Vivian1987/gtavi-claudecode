@@ -166,6 +166,29 @@ class MomentsAndCutTests(unittest.TestCase):
         self.assertEqual(tip_sig.sum(), 0)
         self.assertGreater(cadence[5], 0)
 
+    def test_clip_filename_consistent_across_channels_and_titles(self):
+        import common
+        self.assertEqual(
+            common.clip_filename("caseoh_", 2, "Gator Pool"),
+            "caseoh_clip_2_gator_pool.mp4",
+        )
+        self.assertEqual(
+            common.clip_filename("caseoh_", 5, "caseoh_ Chat LOST IT in GTA 6"),
+            "caseoh_clip_5_chat_lost_it_in_gta_6.mp4",
+        )
+        self.assertEqual(
+            common.clip_filename("Kai Cenat", 3, "Recon Detail!", ext="json"),
+            "kai_cenat_clip_3_recon_detail.json",
+        )
+        self.assertEqual(
+            common.clip_filename("", 1, "Bigfoot Ambush"),
+            "clip_1_bigfoot_ambush.mp4",
+        )
+        self.assertEqual(
+            common.clip_filename("summit1g", 4, ""),
+            "summit1g_clip_4.mp4",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
